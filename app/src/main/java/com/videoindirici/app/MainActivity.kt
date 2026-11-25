@@ -157,7 +157,7 @@ fun VideoDownloaderApp() {
     fun readClipboardUrl(): String? {
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clipText = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() ?: return null
-        val regex = Regex("https?://[^\s]+")
+        val regex = Regex("https?://[^\\s]+")
         return regex.find(clipText)?.value
     }
 
