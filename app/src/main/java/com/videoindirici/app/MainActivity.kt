@@ -35,11 +35,14 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -69,7 +72,6 @@ import com.yausername.youtubedl_android.YoutubeDLRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -84,8 +86,16 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val VIDEO_EXTS = setOf("mp4", "mkv", "webm", "mov", "m4v")
+private enum class MediaTab(val label: String) {
+    ALL("Tümü"),
+    VIDEO("Videolar"),
+    PHOTO("Fotoğraflar"),
+    LIVE_PHOTO("Live Photo")
+}
+
+private val VIDEO_EXTS = setOf("mp4", "mkv", "webm", "m4v")
 private val IMAGE_EXTS = setOf("jpg", "jpeg", "png", "webp")
+private val LIVE_EXTS = setOf("mov", "gif")
 
 private fun getDownloadDir(): File {
     val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Drop")
@@ -93,10 +103,29 @@ private fun getDownloadDir(): File {
     return dir
 }
 
-private fun isVideoFile(file: File): Boolean = file.extension.lowercase(Locale.ROOT) in VIDEO_EXTS
+private fun isLivePhotoFile(file: File): Boolean {
+    val ext = file.extension.lowercase(Locale.ROOT)
+    val name = file.name.lowercase(Locale.ROOT)
+    return ext in LIVE_EXTS || name.startsWith("live_") || "_live" in name
+}
+
+private fun isPhotoFile(file: File): Boolean {
+    val ext = file.extension.lowercase(Locale.ROOT)
+    return ext in IMAGE_EXTS && !isLivePhotoFile(file)
+}
+
+private fun isStandardVideoFile(file: File): Boolean {
+    val ext = file.extension.lowercase(Locale.ROOT)
+    return ext in VIDEO_EXTS && !isLivePhotoFile(file)
+}
+
+private fun isPlayableVideo(file: File): Boolean {
+    val ext = file.extension.lowercase(Locale.ROOT)
+    return ext in VIDEO_EXTS || ext == "mov"
+}
 
 private fun loadDownloadedMedia(): List<File> {
-    val allowed = VIDEO_EXTS + IMAGE_EXTS
+    val allowed = VIDEO_EXTS + IMAGE_EXTS + LIVE_EXTS
     return getDownloadDir().listFiles()
         ?.filter { it.isFile && it.extension.lowercase(Locale.ROOT) in allowed }
         ?.sortedByDescending { it.lastModified() }
@@ -153,7 +182,8 @@ private fun downloadDirectFile(urlStr: String, outFile: File) {
 private fun tryDownloadPhotosFallback(rawUrl: String, downloadDir: File): Int {
     val (resolvedUrl, body) = httpGetText(rawUrl)
     val lower = resolvedUrl.lowercase(Locale.ROOT)
-    val urls = mutableListOf<String>()
+    val photoUrls = mutableListOf<String>()
+    val liveUrls = mutableListOf<String>()
 
     if ("tiktok.com" in lower && "/photo/" in lower) {
         val marker = "__UNIVERSAL_DATA_FOR_REHYDRATION__"
@@ -166,8 +196,10 @@ private fun tryDownloadPhotosFallback(rawUrl: String, downloadDir: File): Int {
                 val regex = Regex(""""urlList"\s*:\s*\[\s*"(https:[^"]+)"""")
                 for (m in regex.findAll(jsonText)) {
                     val u = m.groupValues[1].replace("\\u002F", "/").replace("\\/", "/")
-                    if (("photomode" in u || "tplv-" in u) && u !in urls) {
-                        urls.add(u)
+                    if (("photomode" in u || "tplv-" in u) && u !in photoUrls) {
+                        photoUrls.add(u)
+                    } else if (("mime_type=video" in u || ".mp4" in u) && u !in liveUrls) {
+                        liveUrls.add(u)
                     }
                 }
             }
@@ -183,20 +215,24 @@ private fun tryDownloadPhotosFallback(rawUrl: String, downloadDir: File): Int {
             while (keys.hasNext()) {
                 val item = meta.getJSONObject(keys.next())
                 val imgUrl = item.optJSONObject("s")?.optString("u")?.replace("&amp;", "&")
-                if (!imgUrl.isNullOrBlank()) urls.add(imgUrl)
+                val gifUrl = item.optJSONObject("s")?.optString("gif")?.replace("&amp;", "&")
+                if (!gifUrl.isNullOrBlank()) liveUrls.add(gifUrl)
+                else if (!imgUrl.isNullOrBlank()) photoUrls.add(imgUrl)
             }
         } else {
             val single = postData.optString("url_overridden_by_dest")
-            if (single.endsWith(".jpg") || single.endsWith(".jpeg") || single.endsWith(".png") || single.endsWith(".webp")) {
-                urls.add(single)
+            if (single.endsWith(".gif")) liveUrls.add(single)
+            else if (single.endsWith(".jpg") || single.endsWith(".jpeg") || single.endsWith(".png") || single.endsWith(".webp")) {
+                photoUrls.add(single)
             }
         }
     }
 
-    if (urls.isEmpty()) return 0
+    if (photoUrls.isEmpty() && liveUrls.isEmpty()) return 0
     val stamp = System.currentTimeMillis()
     var saved = 0
-    urls.forEachIndexed { i, imgUrl ->
+
+    photoUrls.forEachIndexed { i, imgUrl ->
         val ext = when {
             ".png" in imgUrl.lowercase(Locale.ROOT) -> "png"
             ".webp" in imgUrl.lowercase(Locale.ROOT) -> "webp"
@@ -205,6 +241,17 @@ private fun tryDownloadPhotosFallback(rawUrl: String, downloadDir: File): Int {
         val out = File(downloadDir, "drop_${stamp}_${i + 1}.$ext")
         try {
             downloadDirectFile(imgUrl, out)
+            if (out.exists() && out.length() > 1024) saved++ else out.delete()
+        } catch (_: Exception) {
+            out.delete()
+        }
+    }
+
+    liveUrls.forEachIndexed { i, liveUrl ->
+        val ext = if (".gif" in liveUrl.lowercase(Locale.ROOT)) "gif" else "mp4"
+        val out = File(downloadDir, "live_${stamp}_${i + 1}.$ext")
+        try {
+            downloadDirectFile(liveUrl, out)
             if (out.exists() && out.length() > 1024) saved++ else out.delete()
         } catch (_: Exception) {
             out.delete()
@@ -289,7 +336,7 @@ fun VideoDownloaderApp() {
                     photosSaved
                 }
                 refreshMedia(); isError = false; progressValue = null
-                statusText = if (photoCount > 0) "$photoCount fotoğraf kaydedildi ✓" else "Kaydedildi · Medya bölümünden açabilirsiniz"
+                statusText = if (photoCount > 0) "$photoCount dosya kaydedildi ✓" else "Kaydedildi · Medya bölümünden açabilirsiniz"
             } catch (e: Exception) {
                 isError = true; progressValue = null; statusText = "İndirilemedi: ${e.localizedMessage ?: "Desteklenmeyen bağlantı"}"
             } finally { isDownloading = false }
@@ -299,7 +346,7 @@ fun VideoDownloaderApp() {
     fun openMedia(file: File) {
         try {
             val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            val mime = if (isVideoFile(file)) "video/*" else "image/*"
+            val mime = if (isPlayableVideo(file)) "video/*" else "image/*"
             context.startActivity(Intent(Intent.ACTION_VIEW).apply { setDataAndType(uri, mime); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) })
         } catch (_: Exception) { isError = true; statusText = "Dosya açılamadı." }
     }
@@ -307,7 +354,7 @@ fun VideoDownloaderApp() {
     fun shareMedia(file: File) {
         try {
             val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            val mime = if (isVideoFile(file)) "video/*" else "image/*"
+            val mime = if (isPlayableVideo(file)) "video/*" else "image/*"
             context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
                 type = mime; putExtra(Intent.EXTRA_STREAM, uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }, "Paylaş"))
@@ -366,25 +413,141 @@ private fun HomeScreen(isDownloading: Boolean, progressValue: Int?, statusText: 
 
 @Composable
 private fun LibraryScreen(files: List<File>, onBack: () -> Unit, onPlay: (File) -> Unit, onShare: (File) -> Unit, onDelete: (File) -> Unit) {
+    var selectedTab by remember { mutableStateOf(MediaTab.ALL) }
+    var pendingDeleteFile by remember { mutableStateOf<File?>(null) }
+
+    val videoFiles = remember(files) { files.filter { isStandardVideoFile(it) } }
+    val photoFiles = remember(files) { files.filter { isPhotoFile(it) } }
+    val liveFiles = remember(files) { files.filter { isLivePhotoFile(it) } }
+
+    val filteredFiles = when (selectedTab) {
+        MediaTab.ALL -> files
+        MediaTab.VIDEO -> videoFiles
+        MediaTab.PHOTO -> photoFiles
+        MediaTab.LIVE_PHOTO -> liveFiles
+    }
+
+    val counts = mapOf(
+        MediaTab.ALL to files.size,
+        MediaTab.VIDEO to videoFiles.size,
+        MediaTab.PHOTO to photoFiles.size,
+        MediaTab.LIVE_PHOTO to liveFiles.size
+    )
+
+    pendingDeleteFile?.let { fileToDelete ->
+        AlertDialog(
+            onDismissRequest = { pendingDeleteFile = null },
+            containerColor = Color.White,
+            shape = RoundedCornerShape(22.dp),
+            title = {
+                Text(
+                    text = "Medyayı Kaldır",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF14161A)
+                )
+            },
+            text = {
+                Text(
+                    text = "Bu medyayı kaldırmaktan emin misiniz?",
+                    fontSize = 14.sp,
+                    color = Color(0xFF5F6570)
+                )
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteFile = null }) {
+                    Text(
+                        text = "Vazgeç",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFF7D838E)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onDelete(fileToDelete)
+                    pendingDeleteFile = null
+                }) {
+                    Text(
+                        text = "Kaldır",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFFD93025)
+                    )
+                }
+            }
+        )
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
-        Row(modifier = Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
             Surface(modifier = Modifier.size(40.dp).clip(CircleShape).clickable(onClick = onBack), shape = CircleShape, color = Color.White, border = BorderStroke(1.dp, Color(0xFFE9ECF2))) {
                 Box(contentAlignment = Alignment.Center) { Text(text = "←", fontSize = 18.sp, color = Color(0xFF111111)) }
             }
             Text(text = "MEDYA", fontSize = 13.sp, fontWeight = FontWeight.Medium, letterSpacing = 4.sp, color = Color(0xFF181A1F))
-            Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) { Text(text = "${files.size}", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF8C929C)) }
+            Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                Text(text = "${filteredFiles.size}", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF8C929C))
+            }
         }
-        if (files.isEmpty()) {
+
+        LazyRow(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(MediaTab.entries) { tab ->
+                val active = tab == selectedTab
+                val count = counts[tab] ?: 0
+                Surface(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .clickable { selectedTab = tab },
+                    shape = RoundedCornerShape(50),
+                    color = if (active) Color(0xFF14161A) else Color.White,
+                    border = if (active) null else BorderStroke(1.dp, Color(0xFFECEFF4)),
+                    shadowElevation = if (active) 2.dp else 0.dp
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = tab.label,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = if (active) Color.White else Color(0xFF3A3E47)
+                        )
+                        Text(
+                            text = "$count",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Normal,
+                            color = if (active) Color(0xFFB8BDC7) else Color(0xFF9AA0AA)
+                        )
+                    }
+                }
+            }
+        }
+
+        if (filteredFiles.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(text = "Henüz dosya yok", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color(0xFF2B2E36))
+                    val emptyTitle = when (selectedTab) {
+                        MediaTab.ALL -> "Henüz medya yok"
+                        MediaTab.VIDEO -> "Henüz video yok"
+                        MediaTab.PHOTO -> "Henüz fotoğraf yok"
+                        MediaTab.LIVE_PHOTO -> "Henüz Live Photo yok"
+                    }
+                    Text(text = emptyTitle, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color(0xFF2B2E36))
                     Spacer(modifier = Modifier.height(6.dp))
-                    Text(text = "İndirdiğiniz video ve fotoğraflar burada görünecek", fontSize = 13.sp, color = Color(0xFF8C929C))
+                    Text(text = "İndirdiğiniz içerikler burada görünecek", fontSize = 13.sp, color = Color(0xFF8C929C))
                 }
             }
         } else {
             LazyColumn(contentPadding = PaddingValues(bottom = 28.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                items(files, key = { it.absolutePath }) { file -> MediaItemCard(file, { onPlay(file) }, { onShare(file) }, { onDelete(file) }) }
+                items(filteredFiles, key = { it.absolutePath }) { file ->
+                    MediaItemCard(file, { onPlay(file) }, { onShare(file) }, { pendingDeleteFile = file })
+                }
             }
         }
     }
@@ -392,11 +555,12 @@ private fun LibraryScreen(files: List<File>, onBack: () -> Unit, onPlay: (File) 
 
 @Composable
 private fun MediaItemCard(file: File, onPlay: () -> Unit, onShare: () -> Unit, onDelete: () -> Unit) {
-    val isVid = isVideoFile(file)
+    val isPlayable = isPlayableVideo(file)
+    val isLive = isLivePhotoFile(file)
     var thumbnail by remember(file.absolutePath) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(file.absolutePath) {
         thumbnail = withContext(Dispatchers.IO) {
-            if (isVid) {
+            if (isPlayable) {
                 val r = MediaMetadataRetriever()
                 try { r.setDataSource(file.absolutePath); r.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) }
                 catch (_: Exception) { null }
@@ -413,7 +577,9 @@ private fun MediaItemCard(file: File, onPlay: () -> Unit, onShare: () -> Unit, o
         Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(modifier = Modifier.size(64.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F3F6)), contentAlignment = Alignment.Center) {
                 thumbnail?.let { Image(bitmap = it.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
-                if (isVid) {
+                if (isLive) {
+                    Box(modifier = Modifier.size(26.dp).clip(CircleShape).background(Color(0xCCFFFFFF)), contentAlignment = Alignment.Center) { Text(text = "◎", fontSize = 12.sp, color = Color(0xFF111111)) }
+                } else if (isPlayable) {
                     Box(modifier = Modifier.size(26.dp).clip(CircleShape).background(Color(0xB3FFFFFF)), contentAlignment = Alignment.Center) { Text(text = "▶", fontSize = 10.sp, color = Color(0xFF111111)) }
                 }
             }
