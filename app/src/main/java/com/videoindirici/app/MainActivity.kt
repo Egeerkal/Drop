@@ -72,9 +72,12 @@ import com.yausername.youtubedl_android.YoutubeDLRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -167,19 +170,112 @@ private fun httpGetText(urlStr: String): Pair<String, String> {
     return current to body
 }
 
-private fun downloadDirectFile(urlStr: String, outFile: File) {
+private fun downloadDirectFile(urlStr: String, outFile: File, requireVideoMime: Boolean = false): Boolean {
     val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+        instanceFollowRedirects = true
         connectTimeout = 15000
         readTimeout = 30000
         setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36")
     }
-    conn.inputStream.use { input ->
-        outFile.outputStream().use { output -> input.copyTo(output) }
+    return try {
+        val ct = (conn.contentType ?: "").lowercase(Locale.ROOT)
+        if (requireVideoMime && !ct.startsWith("video/") && "octet-stream" !in ct) {
+            false
+        } else {
+            conn.inputStream.use { input ->
+                outFile.outputStream().use { output -> input.copyTo(output) }
+            }
+            outFile.exists() && outFile.length() > 1024
+        }
+    } catch (_: Exception) {
+        outFile.delete()
+        false
+    } finally {
+        conn.disconnect()
     }
-    conn.disconnect()
+}
+
+private fun findJsonObjectByKey(node: Any?, targetKey: String): JSONObject? {
+    when (node) {
+        is JSONObject -> {
+            if (node.has(targetKey)) {
+                val candidate = node.optJSONObject(targetKey)
+                if (candidate != null && candidate.has("images")) return candidate
+            }
+            val keys = node.keys()
+            while (keys.hasNext()) {
+                val found = findJsonObjectByKey(node.opt(keys.next()), targetKey)
+                if (found != null) return found
+            }
+        }
+        is JSONArray -> {
+            for (i in 0 until node.length()) {
+                val found = findJsonObjectByKey(node.opt(i), targetKey)
+                if (found != null) return found
+            }
+        }
+    }
+    return null
+}
+
+private fun extractFirstUrl(obj: JSONObject?, key: String): String? {
+    val nested = obj?.optJSONObject(key) ?: return null
+    val list = nested.optJSONArray("urlList") ?: nested.optJSONArray("url_list") ?: return null
+    for (i in 0 until list.length()) {
+        val u = list.optString(i)
+        if (u.startsWith("http")) return u
+    }
+    return null
+}
+
+private fun tryDownloadTikTokViaTikWm(rawUrl: String, downloadDir: File): Int {
+    val encoded = URLEncoder.encode(rawUrl, "UTF-8")
+    val (_, resp) = httpGetText("https://www.tikwm.com/api/?url=$encoded&hd=1")
+    val root = JSONObject(resp)
+    val data = root.optJSONObject("data") ?: return 0
+    val stamp = System.currentTimeMillis()
+    var saved = 0
+
+    // 1. Live Photo / video stream check (hdplay or play)
+    val videoCandidates = listOf(data.optString("hdplay"), data.optString("play"))
+        .filter { it.startsWith("http") }
+    for (vUrl in videoCandidates) {
+        val out = File(downloadDir, "live_${stamp}.mp4")
+        if (downloadDirectFile(vUrl, out, requireVideoMime = true)) {
+            saved++
+            break
+        } else {
+            out.delete()
+        }
+    }
+
+    // 2. Clean slideshow images (no blurred play-button cover)
+    val images = data.optJSONArray("images")
+    if (images != null) {
+        for (i in 0 until images.length()) {
+            val imgUrl = images.optString(i)
+            if (!imgUrl.startsWith("http")) continue
+            val ext = when {
+                ".png" in imgUrl.lowercase(Locale.ROOT) -> "png"
+                ".webp" in imgUrl.lowercase(Locale.ROOT) -> "webp"
+                else -> "jpg"
+            }
+            val out = File(downloadDir, "drop_${stamp}_${i + 1}.$ext")
+            if (downloadDirectFile(imgUrl, out)) saved++ else out.delete()
+        }
+    }
+    return saved
 }
 
 private fun tryDownloadPhotosFallback(rawUrl: String, downloadDir: File): Int {
+    val lowerRaw = rawUrl.lowercase(Locale.ROOT)
+    if ("tiktok.com" in lowerRaw) {
+        try {
+            val tikwmSaved = tryDownloadTikTokViaTikWm(rawUrl, downloadDir)
+            if (tikwmSaved > 0) return tikwmSaved
+        } catch (_: Exception) {}
+    }
+
     val (resolvedUrl, body) = httpGetText(rawUrl)
     val lower = resolvedUrl.lowercase(Locale.ROOT)
     val photoUrls = mutableListOf<String>()
@@ -193,21 +289,34 @@ private fun tryDownloadPhotosFallback(rawUrl: String, downloadDir: File): Int {
             val end = body.indexOf("</script>", start)
             if (start > 0 && end > start) {
                 val jsonText = body.substring(start, end)
-                val regex = Regex(""""urlList"\s*:\s*\[\s*"(https:[^"]+)"""")
-                for (m in regex.findAll(jsonText)) {
-                    val u = m.groupValues[1].replace("\\u002F", "/").replace("\\/", "/")
-                    if (("photomode" in u || "tplv-" in u) && u !in photoUrls) {
-                        photoUrls.add(u)
-                    } else if (("mime_type=video" in u || ".mp4" in u) && u !in liveUrls) {
-                        liveUrls.add(u)
+                try {
+                    val root = JSONObject(jsonText)
+                    val imagePost = findJsonObjectByKey(root, "imagePost")
+                    val images = imagePost?.optJSONArray("images")
+                    if (images != null) {
+                        for (i in 0 until images.length()) {
+                            val item = images.optJSONObject(i) ?: continue
+                            val liveVideo = item.optJSONObject("video") ?: item.optJSONObject("livePhoto")
+                            val liveUrl = extractFirstUrl(liveVideo, "playAddr")
+                                ?: liveVideo?.optString("playAddr")?.takeIf { it.startsWith("http") }
+                                ?: liveVideo?.optString("downloadAddr")?.takeIf { it.startsWith("http") }
+                            if (!liveUrl.isNullOrBlank() && liveUrl !in liveUrls) {
+                                liveUrls.add(liveUrl)
+                            } else {
+                                val imgUrl = extractFirstUrl(item, "imageURL")
+                                if (!imgUrl.isNullOrBlank() && imgUrl !in photoUrls) {
+                                    photoUrls.add(imgUrl)
+                                }
+                            }
+                        }
                     }
-                }
+                } catch (_: Exception) {}
             }
         }
     } else if ("reddit.com" in lower) {
         val clean = resolvedUrl.substringBefore("?").trimEnd('/') + ".json"
         val (_, jsonBody) = httpGetText(clean)
-        val arr = org.json.JSONArray(jsonBody)
+        val arr = JSONArray(jsonBody)
         val postData = arr.getJSONObject(0).getJSONObject("data").getJSONArray("children").getJSONObject(0).getJSONObject("data")
         if (postData.has("media_metadata")) {
             val meta = postData.getJSONObject("media_metadata")
@@ -239,23 +348,13 @@ private fun tryDownloadPhotosFallback(rawUrl: String, downloadDir: File): Int {
             else -> "jpg"
         }
         val out = File(downloadDir, "drop_${stamp}_${i + 1}.$ext")
-        try {
-            downloadDirectFile(imgUrl, out)
-            if (out.exists() && out.length() > 1024) saved++ else out.delete()
-        } catch (_: Exception) {
-            out.delete()
-        }
+        if (downloadDirectFile(imgUrl, out)) saved++ else out.delete()
     }
 
     liveUrls.forEachIndexed { i, liveUrl ->
         val ext = if (".gif" in liveUrl.lowercase(Locale.ROOT)) "gif" else "mp4"
         val out = File(downloadDir, "live_${stamp}_${i + 1}.$ext")
-        try {
-            downloadDirectFile(liveUrl, out)
-            if (out.exists() && out.length() > 1024) saved++ else out.delete()
-        } catch (_: Exception) {
-            out.delete()
-        }
+        if (downloadDirectFile(liveUrl, out)) saved++ else out.delete()
     }
     return saved
 }
